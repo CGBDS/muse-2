@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Muse 2 · Jarvis</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="bg"></div>
+<div class="app">
+  <header class="topbar">
+    <div class="avatar"><span class="pulse"></span>🤖</div>
+    <div class="title">
+      <h1>Muse 2</h1>
+      <p id="status">el clon web de Jarvis · <span id="mode">modo demo</span></p>
+    </div>
+  </header>
+
+  <main id="chat" class="chat"></main>
+
+  <div id="chips" class="chips">
+    <button data-q="¿Quién eres?">¿Quién eres?</button>
+    <button data-q="Cuéntame un chiste">Cuéntame un chiste</button>
+    <button data-q="¿Qué puedes hacer?">¿Qué puedes hacer?</button>
+  </div>
+
+  <footer class="composer">
+    <textarea id="input" rows="1" placeholder="Escríbele a Jarvis..."></textarea>
+    <button id="send" aria-label="Enviar">➤</button>
+  </footer>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
