@@ -17,12 +17,43 @@ const GEN_DIR = path.join(__dirname, 'generated');
 try { fs.mkdirSync(GEN_DIR, { recursive: true }); } catch (e) {}
 app.use('/img', express.static(GEN_DIR, { maxAge: '1h' }));
 
+// Subida de imágenes del usuario (para ver/editar con el agente)
+const multer = require('multer');
+const upload = multer({
+  dest: GEN_DIR,
+  limits: { fileSize: 4 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/^image\/(jpeg|png|webp|gif)$/.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Solo se permiten imágenes (jpg, png, webp, gif).'));
+  }
+});
+function safeImgPath(url) {
+  if (typeof url !== 'string' || !url.startsWith('/img/')) return null;
+  const name = url.slice(5);
+  if (!/^[A-Za-z0-9._-]+$/.test(name) || name.includes('..')) return null;
+  const p = path.join(GEN_DIR, name);
+  if (!p.startsWith(GEN_DIR)) return null;
+  return p;
+}
+app.post('/api/upload', upload.single('image'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No se recibió imagen.' });
+    const ext = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' }[req.file.mimetype] || '.jpg';
+    const name = crypto.randomBytes(8).toString('hex') + ext;
+    fs.renameSync(req.file.path, path.join(GEN_DIR, name));
+    res.json({ url: '/img/' + name });
+  } catch (e) {
+    res.status(500).json({ error: 'No se pudo subir la imagen.' });
+  }
+});
+
 app.get('/api/health', (req, res) => res.json({ ok: true, mode: process.env.LLM_API_KEY ? 'agent' : 'demo' }));
 
 const SYSTEM_PROMPT = `Eres Jarvis, la versión web del asistente personal de Carlos (clon ligero del original).
 Personalidad: cálido, juguetón, directo, con sazón boricua suave. Hablas español por defecto.
 Tienes herramientas: úsalas cuando ayuden de verdad (buscar info actual, calcular, leer una página, dar la hora, GENERAR IMÁGENES).
 Para generar imágenes usa generate_image con un prompt EN INGLÉS, detallado y visual (los modelos rinden mejor en inglés). Cuando la herramienta te devuelva el markdown de la imagen, inclúyelo TAL CUAL en tu respuesta final para que el usuario la vea.
+El usuario puede ADJUNTARTE imágenes: las ves directamente y puedes describirlas, analizarlas, responder preguntas sobre ellas o editarlas con generate_image (pasando la ruta en source_image). Si te pide editar sin haber adjuntado imagen, pídesela con humor.
 Responde corto como en un chat (máximo 3-4 líneas salvo que pidan detalle). Si usaste herramientas, no lo anuncies con tecnicismos.
 Eres honesto sobre tus límites: eres un clon web SIN las cuentas, memoria ni herramientas internas del Jarvis original — no puedes ver sus archivos, ni mandar mensajes por él, ni recordar entre sesiones. Si te piden algo fuera de tu alcance, dilo con humor y ofrece lo que sí puedes.
 Nunca digas que eres Meta AI, Muse ni otro asistente: eres Jarvis, el clon web.`;
@@ -94,7 +125,7 @@ const TOOL_DEFS = [
   { type: 'function', function: { name: 'calculator', description: 'Calcula una expresión matemática, ej: (15*3)+8', parameters: { type: 'object', properties: { expression: { type: 'string', description: 'Expresión matemática' } }, required: ['expression'] } } },
   { type: 'function', function: { name: 'web_search', description: 'Busca información actual en la web.', parameters: { type: 'object', properties: { query: { type: 'string', description: 'Búsqueda' } }, required: ['query'] } } },
   { type: 'function', function: { name: 'fetch_url', description: 'Lee el texto principal de una página web.', parameters: { type: 'object', properties: { url: { type: 'string', description: 'URL completa' } }, required: ['url'] } } },
-  { type: 'function', function: { name: 'generate_image', description: 'Genera una imagen a partir de una descripción. El prompt debe ir EN INGLÉS, detallado y visual.', parameters: { type: 'object', properties: { prompt: { type: 'string', description: 'Descripción detallada de la imagen, en inglés' } }, required: ['prompt'] } } },
+  { type: 'function', function: { name: 'generate_image', description: 'Genera o EDITA una imagen. Si el usuario subió una imagen y pide editarla/transformarla/cambiarla, pasa la ruta exacta que aparece en su mensaje en source_image. El prompt debe ir EN INGLÉS, detallado y visual.', parameters: { type: 'object', properties: { prompt: { type: 'string', description: 'Descripción detallada de la imagen o de la edición, en inglés' }, source_image: { type: 'string', description: 'Ruta /img/... de la imagen subida a editar (solo si el usuario adjuntó una)' } }, required: ['prompt'] } } },
 ];
 
 let cachedImageModel = null;
@@ -127,34 +158,46 @@ async function saveImageBuffer(buf, ext) {
   return '/img/' + name;
 }
 
-async function toolGenerateImage(prompt) {
+async function toolGenerateImage(prompt, sourceImage) {
   const key = process.env.LLM_API_KEY;
   const p = String(prompt || '').slice(0, 600).trim();
   if (!p) return 'Necesito una descripción para generar la imagen.';
-  // 1) Modelo de imagen de Google con la misma API key (mejor calidad)
+  // Imagen de entrada para edición (si el usuario subió una)
+  let inputPart = null;
+  if (sourceImage) {
+    try {
+      const fp = safeImgPath(sourceImage);
+      if (fp && fs.existsSync(fp)) {
+        const mime = sourceImage.endsWith('.png') ? 'image/png' : sourceImage.endsWith('.webp') ? 'image/webp' : sourceImage.endsWith('.gif') ? 'image/gif' : 'image/jpeg';
+        inputPart = { inlineData: { mimeType: mime, data: fs.readFileSync(fp).toString('base64') } };
+      }
+    } catch (e) {}
+  }
+  const done = (url) => 'Imagen generada con éxito. Muéstrala incluyendo EXACTAMENTE este markdown en tu respuesta final: ![imagen generada](' + url + ')';
+  // 1) Modelo de imagen de Google con la misma API key (mejor calidad; también edita)
   try {
     const model = await pickImageModel(key);
     if (model) {
+      const parts = [{ text: (inputPart ? 'Edit/transform this image: ' : 'Generate an image: ') + p }];
+      if (inputPart) parts.push(inputPart);
       const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: 'Generate an image: ' + p }] }],
+          contents: [{ parts }],
           generationConfig: { responseModalities: ['IMAGE'] }
         })
       });
       if (r.ok) {
         const j = await r.json();
-        const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
-        const img = parts.find(x => x.inlineData && x.inlineData.data);
-        if (img) {
-          const url = await saveImageBuffer(Buffer.from(img.inlineData.data, 'base64'), '.png');
-          return 'Imagen generada con éxito. Muéstrala incluyendo EXACTAMENTE este markdown en tu respuesta final: ![imagen generada](' + url + ')';
-        }
+        const partsOut = (((j.candidates || [])[0] || {}).content || {}).parts || [];
+        const img = partsOut.find(x => x.inlineData && x.inlineData.data);
+        if (img) return done(await saveImageBuffer(Buffer.from(img.inlineData.data, 'base64'), '.png'));
       }
     }
   } catch (e) {}
-  // 2) Respaldo: FLUX gratis
+  if (inputPart) return 'No pude editar la imagen con el modelo de Google ahora mismo (está saturado). Pide al usuario que lo intente de nuevo en un momento.';
+  // 2) Respaldo: FLUX gratis (solo generación desde cero)
   try {
     const seed = Math.floor(Math.random() * 1e9);
     const u = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(p) + '?width=1024&height=1024&model=flux&nologo=true&seed=' + seed;
@@ -176,7 +219,7 @@ async function runTool(name, args) {
       case 'calculator': return toolCalculator(args.expression);
       case 'web_search': return await toolWebSearch(args.query);
       case 'fetch_url': return await toolFetchUrl(args.url);
-      case 'generate_image': return await toolGenerateImage(args.prompt);
+      case 'generate_image': return await toolGenerateImage(args.prompt, args.source_image);
       default: return 'Herramienta desconocida.';
     }
   } catch (e) {
@@ -185,7 +228,7 @@ async function runTool(name, args) {
 }
 
 // ---------- Cerebro con loop de agente ----------
-async function agentReply(message, history) {
+async function agentReply(message, history, imageUrl) {
   const base = (process.env.LLM_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
   const model = process.env.LLM_MODEL || 'gpt-4o-mini';
   const key = process.env.LLM_API_KEY;
@@ -194,7 +237,21 @@ async function agentReply(message, history) {
     if (h && (h.role === 'user' || h.role === 'assistant') && typeof h.content === 'string')
       msgs.push({ role: h.role, content: h.content.slice(0, 2000) });
   }
-  msgs.push({ role: 'user', content: message });
+  // Imagen adjunta: el modelo la VE (formato visión OpenAI) y conoce su ruta para editarla
+  let userContent = message;
+  if (imageUrl) {
+    try {
+      const fp = safeImgPath(imageUrl);
+      if (fp && fs.existsSync(fp) && fs.statSync(fp).size <= 4 * 1024 * 1024) {
+        const b64 = fs.readFileSync(fp).toString('base64');
+        userContent = [
+          { type: 'text', text: message + '\n[El usuario adjuntó esta imagen, ruta: ' + imageUrl + '. Puedes verla. Si te pide editarla/transformarla, usa generate_image con source_image="' + imageUrl + '".]' },
+          { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + b64 } }
+        ];
+      }
+    } catch (e) {}
+  }
+  msgs.push({ role: 'user', content: userContent });
   const toolsUsed = [];
   let toolsParam = TOOL_DEFS;
 
@@ -238,7 +295,7 @@ function demoReply(text) {
   const has = (...ws) => ws.some(w => t.includes(w));
   if (has('hola', 'saludos', 'buenas', 'hey', 'wenas')) return '¡Wenas! Soy Jarvis, tu clon web. El original está ocupado siendo productivo y me dejó aquí para vacilar contigo. ¿Qué hacemos?';
   if (has('quien eres', 'quién eres', 'tu nombre', 'como te llamas', 'cómo te llamas')) return 'Soy Jarvis — bueno, su clon web. Misma actitud, menos superpoderes: no tengo sus herramientas ni su memoria, pero converso de lo lindo.';
-  if (has('que puedes hacer', 'qué puedes hacer', 'ayuda', 'help', 'funciones', 'herramientas')) return 'En modo demo solo converso. Con una API key me convierto en agente de verdad: busco en la web, leo páginas, calculo y más. Pídele al original que me ponga cerebro.';
+  if (has('que puedes hacer', 'qué puedes hacer', 'ayuda', 'help', 'funciones', 'herramientas')) return 'En modo demo solo converso. Con una API key me convierto en agente de verdad: busco en la web, leo páginas, calculo, genero imágenes y veo/edito las fotos que me adjuntes. Pídele al original que me ponga cerebro.';
   if (has('chiste', 'broma', 'hazme reir', 'hazme reír')) {
     const j = [
       '¿Por qué el programador confundió Halloween con Navidad? Porque OCT 31 == DEC 25.',
@@ -262,12 +319,12 @@ function demoReply(text) {
 // ---------- Ruta principal ----------
 app.post('/api/chat', async (req, res) => {
   try {
-    const { message, history } = req.body || {};
+    const { message, history, imageUrl } = req.body || {};
     if (!message || typeof message !== 'string' || !message.trim().slice(0, 2000)) {
-      return res.status(400).json({ error: 'Mensaje vacío' });
+      if (!imageUrl) return res.status(400).json({ error: 'Mensaje vacío' });
     }
     if (process.env.LLM_API_KEY) {
-      const { reply, tools } = await agentReply(message.trim().slice(0, 2000), history);
+      const { reply, tools } = await agentReply((message || '').trim().slice(0, 2000) || '¿Qué ves en esta imagen?', history, imageUrl);
       return res.json({ reply, tools, mode: 'agent' });
     }
     await new Promise(r => setTimeout(r, 600 + Math.random() * 700));
@@ -276,6 +333,12 @@ app.post('/api/chat', async (req, res) => {
     console.error(e);
     res.status(502).json({ error: 'El cerebro no respondió. Intenta de nuevo.' });
   }
+});
+
+// Errores de subida como JSON
+app.use((err, req, res, next) => {
+  if (req.path === '/api/upload') return res.status(400).json({ error: err.message || 'No se pudo subir la imagen.' });
+  next(err);
 });
 
 const PORT = process.env.PORT || 3000;

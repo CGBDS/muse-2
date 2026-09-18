@@ -27,7 +27,15 @@
   </div>
 
   <footer class="composer">
-    <textarea id="input" rows="1" placeholder="Escríbele a Jarvis..."></textarea>
+    <input type="file" id="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden>
+    <button id="attach" aria-label="Adjuntar imagen" title="Adjuntar imagen">📎</button>
+    <div class="composer-col">
+      <div id="preview" class="preview" hidden>
+        <img id="preview-img" alt="vista previa">
+        <button id="preview-x" aria-label="Quitar imagen">✕</button>
+      </div>
+      <textarea id="input" rows="1" placeholder="Escríbele a Jarvis..."></textarea>
+    </div>
     <button id="send" aria-label="Enviar">➤</button>
   </footer>
 </div>
