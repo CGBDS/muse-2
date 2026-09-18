@@ -114,13 +114,17 @@ async function agentReply(message, history) {
   }
   msgs.push({ role: 'user', content: message });
   const toolsUsed = [];
+  let toolsParam = TOOL_DEFS;
 
   for (let i = 0; i < 4; i++) {
+    const body = { model, messages: msgs, max_tokens: 500, temperature: 0.8 };
+    if (toolsParam) { body.tools = toolsParam; body.tool_choice = 'auto'; }
     const r = await fetch(base + '/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-      body: JSON.stringify({ model, messages: msgs, tools: TOOL_DEFS, tool_choice: 'auto', max_tokens: 500, temperature: 0.8 })
+      body: JSON.stringify(body)
     });
+    if (!r.ok && toolsParam && r.status === 400) { toolsParam = null; continue; } // el proveedor no soporta tools: seguir como chat normal
     if (!r.ok) throw new Error('LLM http ' + r.status);
     const data = await r.json();
     const choice = data.choices && data.choices[0];
