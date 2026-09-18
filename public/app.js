@@ -10,10 +10,23 @@ fetch('/api/health').then(r => r.json()).then(d => {
   else if (d.mode === 'llm') modeEl.textContent = 'cerebro real';
 }).catch(() => {});
 
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function miniMd(text) {
+  let h = esc(text);
+  h = h.replace(/!\[([^\]]*)\]\((\/img\/[A-Za-z0-9._-]+)\)/g,
+    '<img src="$2" alt="$1" style="max-width:100%;border-radius:12px;margin:8px 0;display:block;" loading="lazy">');
+  h = h.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  h = h.replace(/\n/g, '<br>');
+  return h;
+}
+
 function addMsg(text, who) {
   const div = document.createElement('div');
   div.className = 'msg ' + who;
-  div.textContent = text;
+  if (who === 'bot') div.innerHTML = miniMd(text);
+  else div.textContent = text;
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
   return div;
