@@ -125,7 +125,10 @@ async function agentReply(message, history) {
       body: JSON.stringify(body)
     });
     if (!r.ok && toolsParam && r.status === 400) { toolsParam = null; continue; } // el proveedor no soporta tools: seguir como chat normal
-    if (!r.ok) throw new Error('LLM http ' + r.status);
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      throw new Error('LLM http ' + r.status + ' ' + t.slice(0, 300));
+    }
     const data = await r.json();
     const choice = data.choices && data.choices[0];
     const msg = choice && choice.message;
