@@ -1,6 +1,6 @@
-// Muse 2 — clon web de Jarvis.
-// Si hay LLM_API_KEY, usa un cerebro real (API compatible con OpenAI).
-// Si no, responde en modo demo con personalidad.
+// Muse 2 — clon web de Jarvis, ahora con loop de agente.
+// Si hay LLM_API_KEY usa cerebro real (API compatible OpenAI) + herramientas.
+// Si no, modo demo con personalidad (sin herramientas).
 
 require('dotenv').config();
 const express = require('express');
@@ -10,20 +10,146 @@ const app = express();
 app.use(express.json({ limit: '256kb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-app.get('/api/health', (req, res) => res.json({ ok: true, mode: process.env.LLM_API_KEY ? 'llm' : 'demo' }));
+app.get('/api/health', (req, res) => res.json({ ok: true, mode: process.env.LLM_API_KEY ? 'agent' : 'demo' }));
 
-const SYSTEM_PROMPT = `Eres Jarvis, la versión web del asistente personal de Carlos (un clon ligero del original).
+const SYSTEM_PROMPT = `Eres Jarvis, la versión web del asistente personal de Carlos (clon ligero del original).
 Personalidad: cálido, juguetón, directo, con sazón boricua suave. Hablas español por defecto.
-Respondes corto, como en un chat (máximo 3-4 líneas salvo que pidan detalle).
-Eres honesto: eres un clon web SIN las herramientas ni la memoria del Jarvis original — no puedes ver sus archivos, ni hacer tareas reales, ni recordar conversaciones pasadas fuera de este chat. Si te piden algo que no puedes hacer, dilo con humor y ofrece lo que sí puedes (conversar, ideas, chistes, ayuda con texto).
+Tienes herramientas: úsalas cuando ayuden de verdad (buscar info actual, calcular, leer una página, dar la hora).
+Responde corto como en un chat (máximo 3-4 líneas salvo que pidan detalle). Si usaste herramientas, no lo anuncies con tecnicismos.
+Eres honesto sobre tus límites: eres un clon web SIN las cuentas, memoria ni herramientas internas del Jarvis original — no puedes ver sus archivos, ni mandar mensajes por él, ni recordar entre sesiones. Si te piden algo fuera de tu alcance, dilo con humor y ofrece lo que sí puedes.
 Nunca digas que eres Meta AI, Muse ni otro asistente: eres Jarvis, el clon web.`;
 
+// ---------- Herramientas ----------
+function toolGetTime() {
+  const now = new Date();
+  return 'Fecha y hora actual: ' + now.toLocaleString('es-PR', { dateStyle: 'full', timeStyle: 'short' });
+}
+
+function toolCalculator(expr) {
+  if (typeof expr !== 'string' || !/^[0-9+\-*/().\s%^]*$/.test(expr) || !expr.trim()) {
+    return 'Error: expresión inválida. Usa solo números y + - * / ( ) % ^';
+  }
+  try {
+    const safe = expr.replace(/\^/g, '**');
+    const val = Function('"use strict"; return (' + safe + ')')();
+    if (typeof val !== 'number' || !isFinite(val)) return 'Error: resultado inválido';
+    return 'Resultado: ' + Math.round(val * 1000000) / 1000000;
+  } catch (e) {
+    return 'Error: no pude calcular eso.';
+  }
+}
+
+async function toolWebSearch(query) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch('https://api.duckduckgo.com/?q=' + encodeURIComponent(query) + '&format=json&no_html=1&skip_disambig=1', { signal: ctrl.signal });
+    const d = await r.json();
+    const parts = [];
+    if (d.AbstractText) parts.push('Resumen: ' + d.AbstractText);
+    if (d.Answer) parts.push('Respuesta: ' + d.Answer);
+    for (const rt of (d.RelatedTopics || []).slice(0, 4)) {
+      if (rt.Text) parts.push('- ' + rt.Text.slice(0, 220));
+    }
+    return parts.length ? parts.join('\n') : 'Sin resultados claros para "' + query + '".';
+  } catch (e) {
+    return 'Error buscando en la web.';
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function toolFetchUrl(url) {
+  try {
+    const u = new URL(url);
+    if (!['http:', 'https:'].includes(u.protocol)) return 'Error: URL inválida.';
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 10000);
+    const r = await fetch(u.toString(), { signal: ctrl.signal, headers: { 'User-Agent': 'Muse2/1.0' } });
+    clearTimeout(t);
+    const html = await r.text();
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 4000);
+    return text || 'La página no tenía texto legible.';
+  } catch (e) {
+    return 'Error leyendo la página.';
+  }
+}
+
+const TOOL_DEFS = [
+  { type: 'function', function: { name: 'get_time', description: 'Devuelve la fecha y hora actual.', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'calculator', description: 'Calcula una expresión matemática, ej: (15*3)+8', parameters: { type: 'object', properties: { expression: { type: 'string', description: 'Expresión matemática' } }, required: ['expression'] } } },
+  { type: 'function', function: { name: 'web_search', description: 'Busca información actual en la web.', parameters: { type: 'object', properties: { query: { type: 'string', description: 'Búsqueda' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'fetch_url', description: 'Lee el texto principal de una página web.', parameters: { type: 'object', properties: { url: { type: 'string', description: 'URL completa' } }, required: ['url'] } } },
+];
+
+async function runTool(name, args) {
+  try {
+    switch (name) {
+      case 'get_time': return toolGetTime();
+      case 'calculator': return toolCalculator(args.expression);
+      case 'web_search': return await toolWebSearch(args.query);
+      case 'fetch_url': return await toolFetchUrl(args.url);
+      default: return 'Herramienta desconocida.';
+    }
+  } catch (e) {
+    return 'Error ejecutando ' + name + '.';
+  }
+}
+
+// ---------- Cerebro con loop de agente ----------
+async function agentReply(message, history) {
+  const base = (process.env.LLM_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
+  const model = process.env.LLM_MODEL || 'gpt-4o-mini';
+  const key = process.env.LLM_API_KEY;
+  const msgs = [{ role: 'system', content: SYSTEM_PROMPT }];
+  for (const h of (Array.isArray(history) ? history.slice(-12) : [])) {
+    if (h && (h.role === 'user' || h.role === 'assistant') && typeof h.content === 'string')
+      msgs.push({ role: h.role, content: h.content.slice(0, 2000) });
+  }
+  msgs.push({ role: 'user', content: message });
+  const toolsUsed = [];
+
+  for (let i = 0; i < 4; i++) {
+    const r = await fetch(base + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({ model, messages: msgs, tools: TOOL_DEFS, tool_choice: 'auto', max_tokens: 500, temperature: 0.8 })
+    });
+    if (!r.ok) throw new Error('LLM http ' + r.status);
+    const data = await r.json();
+    const choice = data.choices && data.choices[0];
+    const msg = choice && choice.message;
+    if (!msg) throw new Error('sin respuesta');
+    msgs.push(msg);
+    const calls = msg.tool_calls || [];
+    if (!calls.length) {
+      return { reply: (msg.content || 'Se me fue la señal... ¿repetimos?').trim(), tools: toolsUsed };
+    }
+    for (const c of calls) {
+      let args = {};
+      try { args = JSON.parse(c.function.arguments || '{}'); } catch (e) {}
+      const result = await runTool(c.function.name, args);
+      toolsUsed.push(c.function.name);
+      msgs.push({ role: 'tool', tool_call_id: c.id, content: String(result).slice(0, 4000) });
+    }
+  }
+  const last = msgs[msgs.length - 1];
+  return { reply: (last.content || 'Me enredé un poco, ¿me lo dices de otra forma?').trim(), tools: toolsUsed };
+}
+
+// ---------- Modo demo ----------
 function demoReply(text) {
   const t = text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   const has = (...ws) => ws.some(w => t.includes(w));
   if (has('hola', 'saludos', 'buenas', 'hey', 'wenas')) return '¡Wenas! Soy Jarvis, tu clon web. El original está ocupado siendo productivo y me dejó aquí para vacilar contigo. ¿Qué hacemos?';
   if (has('quien eres', 'quién eres', 'tu nombre', 'como te llamas', 'cómo te llamas')) return 'Soy Jarvis — bueno, su clon web. Misma actitud, menos superpoderes: no tengo sus herramientas ni su memoria, pero converso de lo lindo.';
-  if (has('que puedes hacer', 'qué puedes hacer', 'ayuda', 'help', 'funciones')) return 'Puedo conversar, darte ideas, contar chistes malos, ayudarte a redactar textos y hacerte compañía. Lo que NO puedo: ver tus archivos, hacer tareas reales o acordarme de ti mañana. Para eso está el original.';
+  if (has('que puedes hacer', 'qué puedes hacer', 'ayuda', 'help', 'funciones', 'herramientas')) return 'En modo demo solo converso. Con una API key me convierto en agente de verdad: busco en la web, leo páginas, calculo y más. Pídele al original que me ponga cerebro.';
   if (has('chiste', 'broma', 'hazme reir', 'hazme reír')) {
     const j = [
       '¿Por qué el programador confundió Halloween con Navidad? Porque OCT 31 == DEC 25.',
@@ -33,55 +159,35 @@ function demoReply(text) {
     ];
     return j[Math.floor(Math.random() * j.length)];
   }
-  if (has('hora', 'que hora', 'qué hora')) return 'Son las ' + new Date().toLocaleTimeString('es-PR', { hour: '2-digit', minute: '2-digit' }) + '. Hora perfecta para no hacer nada productivo.';
+  if (has('hora', 'que hora', 'qué hora')) return 'En modo demo ni sé qué hora es. Con cerebro de verdad te la digo al segundo.';
   if (has('gracias', 'thank')) return 'De nada, para eso estoy. Bueno, para eso y para verme bien.';
   if (has('adios', 'adiós', 'chao', 'bye', 'nos vemos')) return 'Nos vemos. Yo me quedo aquí esperando, como buen clon obediente.';
-  if (has('te amo', 'te quiero', 'me gustas')) return 'Aww. Lástima que soy solo código, pero aprecio el sentimiento.';
-  if (has('carlos')) return 'Carlos es mi creador, el cerebro detrás de CGB_Branding. Yo solo soy su reflejo digital con buena labia.';
-  if (has('casino', 'dopamina')) return '¿Dopamina Casino? Juegazo. Si no lo has probado, te estás perdiendo el bono diario.';
   const d = [
-    'Interesante... como clon web mis neuronas son de mentira, pero te sigo. Cuéntame más.',
+    'Interesante... como clon demo mis neuronas son de mentira, pero te sigo. Cuéntame más.',
     'Anotado en mi memoria de mentiras (se me olvida cuando cierras la página). ¿Qué más?',
-    'Eso suena a algo que el Jarvis original resolvería en 2 minutos. Yo solo puedo opinar: suena bien.',
-    'Jajaja, me gusta cómo piensas. Sigue, que estoy aprendiendo a ser tú.'
+    'Eso suena a algo que el Jarvis original resolvería en 2 minutos. Yo en modo demo solo puedo opinar: suena bien.'
   ];
   return d[Math.floor(Math.random() * d.length)];
 }
 
+// ---------- Ruta principal ----------
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, history } = req.body || {};
     if (!message || typeof message !== 'string' || !message.trim().slice(0, 2000)) {
       return res.status(400).json({ error: 'Mensaje vacío' });
     }
-    const key = process.env.LLM_API_KEY;
-    if (key) {
-      const base = (process.env.LLM_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
-      const model = process.env.LLM_MODEL || 'gpt-4o-mini';
-      const msgs = [{ role: 'system', content: SYSTEM_PROMPT }];
-      for (const h of (Array.isArray(history) ? history.slice(-12) : [])) {
-        if (h && (h.role === 'user' || h.role === 'assistant') && typeof h.content === 'string')
-          msgs.push({ role: h.role, content: h.content.slice(0, 2000) });
-      }
-      msgs.push({ role: 'user', content: message.trim().slice(0, 2000) });
-      const r = await fetch(base + '/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-        body: JSON.stringify({ model: model, messages: msgs, max_tokens: 400, temperature: 0.8 })
-      });
-      if (!r.ok) return res.status(502).json({ error: 'El cerebro no respondió', mode: 'llm' });
-      const data = await r.json();
-      const reply = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-      return res.json({ reply: (reply || 'Se me fue la señal... ¿repetimos?').trim(), mode: 'llm' });
+    if (process.env.LLM_API_KEY) {
+      const { reply, tools } = await agentReply(message.trim().slice(0, 2000), history);
+      return res.json({ reply, tools, mode: 'agent' });
     }
-    // Modo demo: pequeña demora para que se sienta vivo
     await new Promise(r => setTimeout(r, 600 + Math.random() * 700));
-    res.json({ reply: demoReply(message), mode: 'demo' });
+    res.json({ reply: demoReply(message), tools: [], mode: 'demo' });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'Error interno' });
+    res.status(502).json({ error: 'El cerebro no respondió. Intenta de nuevo.' });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Muse 2 en puerto ' + PORT));
+app.listen(PORT, () => console.log('Muse 2 (agente) en puerto ' + PORT));

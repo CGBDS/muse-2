@@ -6,7 +6,8 @@ const history = [];
 let busy = false;
 
 fetch('/api/health').then(r => r.json()).then(d => {
-  if (d.mode === 'llm') modeEl.textContent = 'cerebro real';
+  if (d.mode === 'agent') modeEl.textContent = 'agente activo 🛠️';
+  else if (d.mode === 'llm') modeEl.textContent = 'cerebro real';
 }).catch(() => {});
 
 function addMsg(text, who) {
@@ -46,6 +47,13 @@ async function send(text) {
     t.remove();
     const reply = data.reply || 'Se me cruzaron los cables... ¿intentamos de nuevo?';
     addMsg(reply, 'bot');
+    if (data.tools && data.tools.length) {
+      const tag = document.createElement('div');
+      tag.style.cssText = 'align-self:flex-start;font-size:11px;color:#A572FF;font-family:system-ui;opacity:.8;margin-top:-6px;';
+      tag.textContent = '🛠️ usó: ' + [...new Set(data.tools)].join(', ');
+      chat.appendChild(tag);
+      chat.scrollTop = chat.scrollHeight;
+    }
     history.push({ role: 'user', content: msg }, { role: 'assistant', content: reply });
     if (history.length > 24) history.splice(0, history.length - 24);
   } catch (e) {
