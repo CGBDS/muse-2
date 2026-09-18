@@ -264,6 +264,12 @@ async function agentReply(message, history, imageUrl) {
       body: JSON.stringify(body)
     });
     if (!r.ok && toolsParam && r.status === 400) { toolsParam = null; continue; } // el proveedor no soporta tools: seguir como chat normal
+    if (r.status === 429) {
+      return { reply: 'Me quedé sin turnos gratis de Google por ahora 😅 — entre las pruebas de hoy se gastó la cuota gratuita. Se renueva sola en unos minutos; inténtalo de nuevo en un rato.', tools: toolsUsed };
+    }
+    if (r.status === 503) {
+      return { reply: 'Google está saturado ahora mismo y no me dejó pensar. Dame un brequecito e inténtalo de nuevo en un minuto.', tools: toolsUsed };
+    }
     if (!r.ok) {
       const t = await r.text().catch(() => '');
       throw new Error('LLM http ' + r.status + ' ' + t.slice(0, 300));
